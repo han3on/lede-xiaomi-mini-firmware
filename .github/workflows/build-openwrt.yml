@@ -19,6 +19,16 @@ on:
         description: 'LEDE 源码分支/标签/提交（留空则为 master）'
         required: false
         default: ''
+  # 改了配置或构建脚本就自动编一版，省得手动点 Run workflow
+  push:
+    branches: [main]
+    paths:
+      - '.config'
+      - 'withaliyun.config'
+      - 'feeds.conf.default'
+      - 'diy-part1.sh'
+      - 'diy-part2.sh'
+      - '.github/workflows/build-openwrt.yml'
   repository_dispatch:
     types: [source-code-update]
 
