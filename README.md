@@ -23,14 +23,14 @@
 
 ## 固件里有什么
 
-基于 Lean LEDE，内核随源码走（历史存档版本为 5.4，当前源码为 6.x）。
+基于 Lean LEDE，内核随源码走。ramips 目标目前的 `KERNEL_PATCHVER` 是 **5.10**（历史存档配置写的是 5.4，`make defconfig` 会自动纠正到源码实际支持的版本）。
 
 **LuCI 应用**
 
 | 插件 | 用途 |
 |---|---|
 | `luci-app-ssr-plus` | 科学上网（SS/SSR/V2Ray/Trojan 客户端） |
-| `luci-app-samba` + `samba36-server` | USB 硬盘共享 |
+| `luci-app-ksmbd` + `ksmbd-server` | USB 硬盘 SMB 共享（内核态实现） |
 | `luci-app-aria2` + `ariang` | 离线下载 + 网页前端 |
 | `luci-app-vsftpd` | FTP 访问硬盘 |
 | `luci-app-ddns` | 动态域名 |
@@ -40,13 +40,15 @@
 | `luci-app-autoreboot` | 定时重启 |
 | `luci-theme-bootstrap` | 默认主题 |
 
-**存储相关依赖**：`kmod-usb-storage`、`kmod-usb-storage-extras`、`kmod-fs-ext4`、`kmod-fs-vfat`、`kmod-fs-exfat`、`kmod-fs-ntfs3`、`block-mount`、`automount`
+**存储相关依赖**：`kmod-usb-storage`、`kmod-usb-storage-extras`、`kmod-fs-ext4`、`kmod-fs-vfat`、`kmod-fs-exfat`、`kmod-fs-ntfs3`、`block-mount`、`automount`、`kmod-fs-cifsd`（ksmbd 的内核模块）
+
+**注意 SMB 实现已更换**：Lean 的软件源里 `samba36-server` 已经不存在了，旧的 `luci-app-samba` 依赖它，会直接变成不可选。因此改用内核态的 `ksmbd`——体积只有几百 KB（samba4 要好几 MB，16MB flash 塞不下），MT7620 这种弱 CPU 上吞吐也更好。界面位置仍是 **网络存储 → 网络共享**，新固件上原来 samba 的配置不会保留，需要重新添加共享目录。
 
 **相比 Lean 默认配置删掉的**：`luci-app-accesscontrol`、`luci-app-nlbwmon`、`luci-app-upnp`、`luci-app-vlmcsd`、`luci-app-wol` —— 都是些边角功能，省下来的空间留给上面这些。
 
 **默认参数**：LAN `192.168.1.1`，无 root 密码（首次登录请立刻设置），`dnsmasq-full`，`dropbear`，时间区 `Asia/Shanghai`。
 
-装完固件约 **11.2MB**，16MB flash 里还能剩下 4MB 左右的 overlay 空间。
+装完固件约 **11.2MB**，设备在源码里的 `IMAGE_SIZE` 是 `15872k`（约 15.5MB），刷进去后 overlay 还能剩 4MB 左右。
 
 ## 仓库结构
 
@@ -55,15 +57,17 @@
 ├── .config                     # 默认编译配置（不含阿里云盘）
 ├── withaliyun.config           # 在 .config 基础上增加 aliyundrive-webdav
 ├── feeds.conf.default          # Lean 官方源 + helloworld 源
-├── diy-part1.sh                # feeds update 之前执行的自定义脚本
-├── diy-part2.sh                # feeds install 之后执行的自定义脚本
+├── diy-part1.sh                # feeds update 之前执行的自定义脚本（当前为空壳）
+├── diy-part2.sh                # defconfig 之前修正 .config，适配当前源码
 └── .github/workflows
     ├── build-openwrt.yml           # 默认配置，编译并发布 Release
     ├── build-openwrt-withaliyun.yml # 阿里云盘版本
     └── update-checker.yml          # 源码更新检查（手动触发）
 ```
 
-`diy-part1.sh` / `diy-part2.sh` 目前是空壳（模板默认内容全部注释掉），想改默认 IP、预置配置、加第三方源都在这里写。
+`diy-part1.sh` 目前是空壳（模板内容全部注释掉），想加第三方软件源在这里写。
+
+`diy-part2.sh` 会在 `make defconfig` 之前修正 `.config` 里两处与当前源码不符的地方：SMB 实现从 samba36 换成 ksmbd、语言包 `zh-cn` 改名为 `zh_Hans`。脚本末尾有自检，改不成功会直接中止编译，不会产出一个缺功能的固件。
 
 ## 自己编译
 
@@ -81,7 +85,13 @@
 
 ### 关于 `.config` 的版本漂移
 
-仓库里的 `.config` 是 2022 年存档下来的一份完整配置，直接喂给当前 LEDE master 会有“引用了已不存在的包”的情况。工作流里专门加了 `Align configuration with current source` 一步：先 `make defconfig` 对齐，再把被剔除的配置项打印到日志，构建 Summary 里也能看到实际的设备、源码提交和内核版本。
+仓库里的 `.config` 是 2022 年存档下来的一份完整配置，直接喂给当前 LEDE master 会有“引用了已不存在的包”的情况。工作流里专门加了 `Align configuration with current source` 一步：
+
+1. 先 `make defconfig` 对齐，把被剔除的配置项打印到日志
+2. **校验目标设备**是否仍是 `xiaomi_miwifi-mini`，被改掉就直接失败
+3. **校验核心插件** `luci-app-ssr-plus`、`luci-app-ksmbd` 是否还在，缺一个就直接失败
+
+这两道校验的意义是：让构建在几分钟内失败，而不是跑满 2–3 小时后产出一个“能刷但功能不全”的固件。Summary 里能看到实际设备、源码提交、内核版本，以及对齐前后启用的包数量。
 
 如果某些老插件在新源码里确实没了，需要重新在 `make menuconfig` 里选一遍（可以用 SSH 调试模式进容器生成），或者把 `source_ref` 指到更早的提交上先跑通。
 
@@ -140,7 +150,7 @@ mtd -r write /tmp/openwrt-ramips-mt7620-xiaomi_miwifi-mini-squashfs-sysupgrade.b
 1. 插上硬盘（机械盘务必用**带独立供电**的硬盘盒，mini 的 USB 口带不动 2.5 寸机械盘，容易掉盘甚至重启）
 2. LuCI → **系统 → 挂载点**，确认识别到设备，格式建议 **ext4**（NTFS/exFAT 能读但写入性能和 CPU 占用都更差）
 3. 挂到 `/mnt/sda1`，勾选“启用”
-4. **网络存储 → 网络共享**，添加共享目录 `/mnt/sda1`，设好允许用户
+4. **网络存储 → 网络共享**，添加共享目录 `/mnt/sda1`，设好允许用户（ksmbd 首次进入需要先设一个 SMB 用户密码）
 
 访问方式：`\\192.168.1.1`（Windows）或 `smb://192.168.1.1`（macOS/手机）。
 
@@ -170,6 +180,18 @@ LuCI → **服务 → SSR Plus**，订阅链接填进去更新节点，用**绕�
 现在固定 `ubuntu-24.04`。如果遇到宿主工具（host tools）编译报错，把工作流里 `runs-on` 改成 `ubuntu-22.04` 试一次——老版本的 LEDE 在新工具链上偶有兼容问题。
 
 ## 维护记录
+
+**2026-10-21 修复编译阻断问题**
+
+- `samba36-server` 已从 Lean 源移除，旧的 `luci-app-samba` 依赖不成立 → SMB 共享改用 `luci-app-ksmbd` + `ksmbd-server`（内核态，体积小）。不改的话 defconfig 会静默丢掉整个共享功能
+- LuCI 语言包命名由 `zh-cn` 改为 `zh_Hans`，同步修正，避免中文界面丢失
+- 上述两项在 `diy-part2.sh` 里做定点修正（`.config` 是 6800 行存档，不值得整体重写），脚本带自检，改不动就中止
+- `source_ref` 支持填提交号（原来只支持分支，`git clone -b <sha>` 会失败）
+- 目标设备与核心插件增加硬校验，缺失即失败
+- 编译失败后不再继续执行打包 / 发 Release，避免拿空目录发布
+- 上传产物改为 `if-no-files-found: error`，没产物就是失败
+- 两个工作流的并发组加上工作流名，互不顶掉
+- 磁盘清理增加 CodeQL、Swift、JVM、boost、docker 镜像
 
 **2026-10 重构**
 
