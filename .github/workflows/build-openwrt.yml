@@ -119,9 +119,9 @@ jobs:
           | head -50 || true
         {
           echo "### 构建信息"
-          echo "- 设备：\`$(grep -E '^CONFIG_TARGET_.*DEVICE_.*=y' .config | head -1 | sed -r 's/.*DEVICE_(.*)=y/\1/')\'"
-          echo "- 源码：\`${REPO_URL##*/}@${LEDE_COMMIT}\`"
-          echo "- 内核：\`$(grep -E '^CONFIG_LINUX_[0-9_]+=y' .config | head -1 | sed 's/CONFIG_LINUX_//; s/=y//; s/_/./g')\'"
+          echo "- 设备：$(grep -E '^CONFIG_TARGET_.*DEVICE_.*=y' .config | head -1 | sed -r 's/.*DEVICE_(.*)=y/\1/')"
+          echo "- 源码：${REPO_URL##*/}@${LEDE_COMMIT}"
+          echo "- 内核：$(grep -E '^CONFIG_LINUX_[0-9_]+=y' .config | head -1 | sed 's/CONFIG_LINUX_//; s/=y//; s/_/./g')"
         } >> $GITHUB_STEP_SUMMARY
 
     - name: SSH connection to Actions
@@ -188,8 +188,8 @@ jobs:
         {
           echo "小米路由器 mini（R1CM）专用固件，基于 Lean 的 LEDE 编译。"
           echo ""
-          echo "- 源码：\`${REPO_URL##*/}@${LEDE_COMMIT}\`"
-          echo "- 目标：\`ramips/mt7620\` · \`xiaomi_miwifi-mini\`"
+          echo "- 源码：${REPO_URL##*/}@${LEDE_COMMIT}"
+          echo "- 目标：ramips/mt7620 · xiaomi_miwifi-mini"
           echo "- 构建时间：$(date +'%Y-%m-%d %H:%M %Z')"
           echo ""
           echo "#### 固件文件"
@@ -198,8 +198,8 @@ jobs:
           echo '```'
           echo ""
           echo "#### 刷机"
-          echo "1. 把 \`*-sysupgrade.bin\` 上传到路由器 \`/tmp\`"
-          echo "2. 执行 \`sysupgrade -n /tmp/<文件名>.bin\`"
+          echo "1. 把 *-sysupgrade.bin 上传到路由器 /tmp"
+          echo "2. 执行 sysupgrade -n /tmp/<文件名>.bin"
           echo "3. 全程不要断电，重启后访问 http://192.168.1.1"
         } > release.txt
         echo "status=success" >> $GITHUB_OUTPUT
