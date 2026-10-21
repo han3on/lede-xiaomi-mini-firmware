@@ -26,8 +26,9 @@ on:
 permissions:
   contents: write
 
+# 两个构建工作流各自排队，不要互相顶掉
 concurrency:
-  group: build-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -37,6 +38,9 @@ env:
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
+  # 目标设备与必须编进去的核心插件，缺少任何一个都直接失败
+  TARGET_DEVICE: ramips_mt7620_DEVICE_xiaomi_miwifi-mini
+  REQUIRED_PKGS: luci-app-ssr-plus luci-app-ksmbd
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
@@ -53,7 +57,10 @@ jobs:
 
     - name: Free disk space
       run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                    /usr/share/swift /usr/lib/jvm
+        sudo docker image prune -af >/dev/null 2>&1 || true
         sudo apt-get -qq clean >/dev/null 2>&1 || true
         df -hT /
 
@@ -73,13 +80,16 @@ jobs:
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
 
+    # source_ref 可能是分支、标签，也可能是提交号；提交号不能直接给 git clone -b
     - name: Clone source code
       working-directory: /workdir
       run: |
         df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        git clone $REPO_URL openwrt
         cd openwrt
+        git checkout "$REPO_BRANCH"
         echo "LEDE_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+        echo "源码版本：$(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
     - name: Load custom feeds
@@ -109,19 +119,44 @@ jobs:
       run: |
         cd openwrt
         cp .config ../config.before
+        BEFORE=$(grep -cE '^CONFIG_PACKAGE_.*=y$' ../config.before || true)
         make defconfig > /tmp/defconfig.log 2>&1 || { cat /tmp/defconfig.log; exit 1; }
+        AFTER=$(grep -cE '^CONFIG_PACKAGE_.*=y$' .config || true)
+        echo "对齐前启用包：$BEFORE 个；对齐后：$AFTER 个"
+
         echo "==== 目标设备 ===="
         grep -E '^CONFIG_TARGET_.*DEVICE_.*=y' .config || true
+
+        # 设备被改掉的话，后面几小时全白费，这里直接拦住
+        if ! grep -qE "^CONFIG_TARGET_${TARGET_DEVICE}=y" .config; then
+          echo "::error::对齐后目标设备丢失：${TARGET_DEVICE}"
+          grep -E '^CONFIG_TARGET_ramips_mt7620_DEVICE_.*=y' .config || true
+          exit 1
+        fi
+
         echo "==== 因源码中不存在而被剔除的包（最多 50 条）===="
         comm -23 \
           <(sort ../config.before | grep -E '^CONFIG_PACKAGE_.*=y$') \
           <(sort .config        | grep -E '^CONFIG_PACKAGE_.*=y$') \
           | head -50 || true
+
+        # 核心插件缺失不算“小瑕疵”，是要用的功能没了
+        MISSING=""
+        for p in $REQUIRED_PKGS; do
+          grep -qE "^CONFIG_PACKAGE_${p}=y" .config || MISSING="$MISSING $p"
+        done
+        if [ -n "$MISSING" ]; then
+          echo "::error::核心插件在对齐后丢失：$MISSING"
+          grep -E "PACKAGE_(luci-app-ssr-plus|luci-app-ksmbd)" .config || true
+          exit 1
+        fi
+
         {
           echo "### 构建信息"
           echo "- 设备：$(grep -E '^CONFIG_TARGET_.*DEVICE_.*=y' .config | head -1 | sed -r 's/.*DEVICE_(.*)=y/\1/')"
           echo "- 源码：${REPO_URL##*/}@${LEDE_COMMIT}"
           echo "- 内核：$(grep -E '^CONFIG_LINUX_[0-9_]+=y' .config | head -1 | sed 's/CONFIG_LINUX_//; s/=y//; s/_/./g')"
+          echo "- 启用包：对齐前 ${BEFORE} 个 → 对齐后 ${AFTER} 个"
         } >> $GITHUB_STEP_SUMMARY
 
     - name: SSH connection to Actions
@@ -160,9 +195,10 @@ jobs:
         path: openwrt/bin
         retention-days: 7
 
+    # 编译失败时不要再往下跑打包/发版，否则会拿半成品或空目录去发 Release
     - name: Organize files
       id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
         cd openwrt/bin/targets/*/*
         rm -rf packages
@@ -177,11 +213,11 @@ jobs:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
         retention-days: 7
-        if-no-files-found: warn
+        if-no-files-found: error
 
     - name: Generate release tag and notes
       id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
         TAG="$(date +"%Y.%m.%d-%H%M")"
         echo "release_tag=$TAG" >> $GITHUB_OUTPUT
@@ -215,7 +251,7 @@ jobs:
 
     # 只保留最近 3 个 Release，把更早的连同 tag 一起删掉
     - name: Prune old releases
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
