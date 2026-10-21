@@ -1,58 +1,52 @@
 #
-# Copyright (c) 2019-2021 P3TERX <https://p3terx.com>
+# 源码更新检查器
 #
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
+# 对比 Lean 的 LEDE 仓库 HEAD 提交，发现新提交就触发一次编译。
+# 需要在本仓库 Secrets 里配置 ACTIONS_TRIGGER_PAT（带 repo 权限的 Personal Access Token），
+# 否则 repository-dispatch 这一步会失败。
 #
-# https://github.com/P3TERX/Actions-OpenWrt
-# File: .github/workflows/update-checker.yml
-# Description: Source code update checker
+# 默认只允许手动运行。想让它自动跟源码走，取消下面 schedule 的注释即可。
 #
 
 name: Update Checker
+
+on:
+  workflow_dispatch:
+#  schedule:
+#    - cron: '0 18 * * 0'   # 每周一 02:00 (UTC+8)
 
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
 
-on:
-  workflow_dispatch:
-#  schedule:
-#    - cron: 0 */18 * * *
+permissions:
+  contents: read
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-
-    - name: Get Commit Hash
+    - name: Get commit hash
       id: getHash
       run: |
         git clone --depth 1 $REPO_URL -b $REPO_BRANCH .
-        echo "::set-output name=commitHash::$(git rev-parse HEAD)"
+        echo "commitHash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
-    - name: Compare Commit Hash
+    - name: Compare commit hash
       id: cacheHash
-      uses: actions/cache@v2
+      uses: actions/cache@v4
       with:
         path: .commitHash
         key: HEAD-${{ steps.getHash.outputs.commitHash }}
 
-    - name: Save New Commit Hash
+    - name: Save new commit hash
       if: steps.cacheHash.outputs.cache-hit != 'true'
-      run: |
-        echo ${{ steps.getHash.outputs.commitHash }} | tee .commitHash
+      run: echo ${{ steps.getHash.outputs.commitHash }} | tee .commitHash
 
     - name: Trigger build
       if: steps.cacheHash.outputs.cache-hit != 'true'
-      uses: peter-evans/repository-dispatch@v1
+      uses: peter-evans/repository-dispatch@v3
       with:
         token: ${{ secrets.ACTIONS_TRIGGER_PAT }}
-        event-type: Source Code Update
-
-    - name: Delete workflow runs
-      uses: GitRML/delete-workflow-runs@main
-      with:
-        retain_days: 1
-        keep_minimum_runs: 1
+        event-type: source-code-update
