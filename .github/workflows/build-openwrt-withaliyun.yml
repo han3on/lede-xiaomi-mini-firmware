@@ -1,54 +1,73 @@
 #
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
+# 小米路由器 mini（R1CM）固件自动编译 —— 带阿里云盘 WebDAV 版本
 #
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
+# 基于 P3TERX/Actions-OpenWrt 模板改写，源码取自 coolsnowwolf/lede。
+# 2026-10 现代化改造：ubuntu-24.04 runner、$GITHUB_OUTPUT/$GITHUB_ENV、
+# actions/* v4、gh CLI 清理旧 Release、保留构建日志以便排查。
 #
 
 name: Build OpenWrt With Aliyun
 
 on:
-  repository_dispatch:
   workflow_dispatch:
     inputs:
       ssh:
-        description: 'SSH connection to Actions'
+        description: 'SSH 连接到 Actions（调试用）'
         required: false
         default: 'false'
+      source_ref:
+        description: 'LEDE 源码分支/标签/提交（留空则为 master）'
+        required: false
+        default: ''
+  repository_dispatch:
+    types: [source-code-update]
+
+# GITHUB_TOKEN 需要写权限才能创建 Release / 删除标签
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede
-  REPO_BRANCH: master
+  REPO_BRANCH: ${{ github.event.inputs.source_ref || 'master' }}
   FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: withaliyun.config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
-  UPLOAD_COWTRANSFER: false
-  UPLOAD_WETRANSFER: false
   UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
 
     steps:
     - name: Checkout
-      uses: actions/checkout@main
+      uses: actions/checkout@v4
 
-    - name: Initialization environment
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt-get -qq clean >/dev/null 2>&1 || true
+        df -hT /
+
+    - name: Install build dependencies
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
-        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq install --no-install-recommends \
+          build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses-dev libssl-dev python3-setuptools python3-pyelftools \
+          rsync swig unzip zlib1g-dev file wget ccache libelf-dev libtool-bin \
+          autoconf automake pkg-config time patch perl subversion mercurial \
+          p7zip-full lzop zstd xxd libglib2.0-dev device-tree-compiler
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
         sudo mkdir -p /workdir
@@ -59,11 +78,13 @@ jobs:
       run: |
         df -hT $PWD
         git clone $REPO_URL -b $REPO_BRANCH openwrt
+        cd openwrt
+        echo "LEDE_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
     - name: Load custom feeds
       run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        if [ -e $FEEDS_CONF ]; then mv $FEEDS_CONF openwrt/feeds.conf.default; fi
         chmod +x $DIY_P1_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P1_SH
@@ -76,24 +97,42 @@ jobs:
 
     - name: Load custom configuration
       run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        if [ -e files ]; then mv files openwrt/files; fi
+        if [ -e $CONFIG_FILE ]; then mv $CONFIG_FILE openwrt/.config; fi
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
 
-    - name: SSH connection to Actions
-      uses: P3TERX/ssh2actions@v1.0.0
-      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
-      env:
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-
-    - name: Download package
-      id: package
+    # 仓库里的 .config 是历史存档，直接喂给当前源码可能引用已删除的包。
+    # 这里先对齐一次，并把被剔除的选项打印到日志里，避免编译到一半才报错。
+    - name: Align configuration with current source
       run: |
         cd openwrt
-        make defconfig
+        cp .config ../config.before
+        make defconfig > /tmp/defconfig.log 2>&1 || { cat /tmp/defconfig.log; exit 1; }
+        echo "==== 目标设备 ===="
+        grep -E '^CONFIG_TARGET_.*DEVICE_.*=y' .config || true
+        echo "==== 因源码中不存在而被剔除的包（最多 50 条）===="
+        comm -23 \
+          <(sort ../config.before | grep -E '^CONFIG_PACKAGE_.*=y$') \
+          <(sort .config        | grep -E '^CONFIG_PACKAGE_.*=y$') \
+          | head -50 || true
+        {
+          echo "### 构建信息"
+          echo "- 设备：\`$(grep -E '^CONFIG_TARGET_.*DEVICE_.*=y' .config | head -1 | sed -r 's/.*DEVICE_(.*)=y/\1/')\'"
+          echo "- 源码：\`${REPO_URL##*/}@${LEDE_COMMIT}\`"
+          echo "- 内核：\`$(grep -E '^CONFIG_LINUX_[0-9_]+=y' .config | head -1 | sed 's/CONFIG_LINUX_//; s/=y//; s/_/./g')\'"
+        } >> $GITHUB_STEP_SUMMARY
+
+    - name: SSH connection to Actions
+      uses: mxschmitt/action-tmate@v3
+      if: github.event.inputs.ssh == 'true'
+      with:
+        limit-access-to-actor: true
+
+    - name: Download package
+      run: |
+        cd openwrt
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -104,9 +143,9 @@ jobs:
         cd openwrt
         echo -e "$(nproc) thread compile"
         make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "::set-output name=status::success"
+        echo "status=success" >> $GITHUB_OUTPUT
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        if [ -s DEVICE_NAME ]; then echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV; fi
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
     - name: Check space usage
@@ -114,11 +153,12 @@ jobs:
       run: df -hT
 
     - name: Upload bin directory
-      uses: actions/upload-artifact@main
+      uses: actions/upload-artifact@v4
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: openwrt/bin
+        retention-days: 7
 
     - name: Organize files
       id: organize
@@ -127,64 +167,63 @@ jobs:
         cd openwrt/bin/targets/*/*
         rm -rf packages
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "::set-output name=status::success"
+        echo "status=success" >> $GITHUB_OUTPUT
+        ls -lh
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
+    - name: Upload firmware artifact
+      uses: actions/upload-artifact@v4
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
+        retention-days: 7
+        if-no-files-found: warn
 
-    - name: Upload firmware to cowtransfer
-      id: cowtransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
-        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
-        echo "::set-output name=url::$(cat cowtransfer.log | grep https | cut -f3 -d" ")"
-
-    - name: Upload firmware to WeTransfer
-      id: wetransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
-        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
-        echo "::set-output name=url::$(cat wetransfer.log | grep https | cut -f3 -d" ")"
-
-    - name: Generate release tag
+    - name: Generate release tag and notes
       id: tag
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
-        echo "::set-output name=release_tag::$(date +"%Y.%m.%d-%H%M")"
-        touch release.txt
-        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
-        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
-        echo "::set-output name=status::success"
+        TAG="$(date +"%Y.%m.%d-%H%M")"
+        echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+        {
+          echo "小米路由器 mini（R1CM）专用固件，基于 Lean 的 LEDE 编译。"
+          echo ""
+          echo "- 源码：\`${REPO_URL##*/}@${LEDE_COMMIT}\`"
+          echo "- 目标：\`ramips/mt7620\` · \`xiaomi_miwifi-mini\`"
+          echo "- 构建时间：$(date +'%Y-%m-%d %H:%M %Z')"
+          echo ""
+          echo "#### 固件文件"
+          echo '```'
+          ( cd "$FIRMWARE" && { ls -1 *.bin 2>/dev/null || true; }; echo; { sha256sum *.bin 2>/dev/null || true; } )
+          echo '```'
+          echo ""
+          echo "#### 刷机"
+          echo "1. 把 \`*-sysupgrade.bin\` 上传到路由器 \`/tmp\`"
+          echo "2. 执行 \`sysupgrade -n /tmp/<文件名>.bin\`"
+          echo "3. 全程不要断电，重启后访问 http://192.168.1.1"
+        } > release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Upload firmware to release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
+        name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
         files: ${{ env.FIRMWARE }}/*
 
-    - name: Delete workflow runs
-      uses: GitRML/delete-workflow-runs@main
-      with:
-        retain_days: 1
-        keep_minimum_runs: 3
-
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.1.0
+    # 只保留最近 3 个 Release，把更早的连同 tag 一起删掉
+    - name: Prune old releases
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release list --limit 100 --json tagName,createdAt \
+          --jq 'sort_by(.createdAt) | reverse | .[].tagName' > /tmp/tags.txt
+        tail -n +4 /tmp/tags.txt | while read -r tag; do
+          if [ -n "$tag" ]; then
+            echo "删除旧版本：$tag"
+            gh release delete "$tag" --yes --cleanup-tag || true
+          fi
+        done
