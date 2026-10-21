@@ -1,14 +1,15 @@
 #
-# 小米路由器 mini（R1CM）固件编译（仅手动触发）
+# 小米路由器 mini（R1CM）固件自动编译
 #
 # 基于 P3TERX/Actions-OpenWrt 模板改写，源码取自 coolsnowwolf/lede。
 # 2026-10 现代化改造：ubuntu-24.04 runner、$GITHUB_OUTPUT/$GITHUB_ENV、
 # actions/* v4、gh CLI 清理旧 Release、保留构建日志以便排查。
-# 触发方式：仅 workflow_dispatch 手动运行，不随 push 自动编译。
 #
 
 name: Build OpenWrt
 
+# 触发方式：仅 workflow_dispatch 手动运行，不随 push 自动编译。
+# 改完 .config / diy 脚本 / 本文件都不会自动开跑，必须自己点 Run workflow。
 on:
   workflow_dispatch:
     inputs:
@@ -20,8 +21,7 @@ on:
         description: 'LEDE 源码分支/标签/提交（留空则为 master）'
         required: false
         default: ''
-  # 本工作流只允许手动触发（Actions → Run workflow）。
-  # 推送代码、改 .config 都不会自动出包，避免无意中占用 runner 时间。
+  # 保留给 update-checker 用，需自备 PAT，默认不启用
   repository_dispatch:
     types: [source-code-update]
 
@@ -179,12 +179,40 @@ jobs:
       id: compile
       run: |
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
+        # 没有 pipefail 的话，make 的失败码会被 tee 覆盖成 0，编译失败也会被当成成功
+        set -o pipefail
+        echo "$(nproc) thread compile"
+        make -j$(nproc) 2>&1 | tee build.log \
+          || make -j1 2>&1 | tee -a build.log \
+          || make -j1 V=s 2>&1 | tee -a build.log
         echo "status=success" >> $GITHUB_OUTPUT
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
         if [ -s DEVICE_NAME ]; then echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV; fi
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    # 失败时把日志尾部直接贴进 Job Summary，不用再下载整个日志包
+    - name: Build log tail on failure
+      if: failure()
+      run: |
+        LOG=openwrt/build.log
+        if [ -f "$LOG" ]; then
+          echo "### 编译失败：build.log 末尾 200 行" >> $GITHUB_STEP_SUMMARY
+          echo '<details><summary>展开查看</summary>' >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          tail -n 200 "$LOG" >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
+          echo "::error::编译失败，末尾日志已写入 Job Summary"
+        fi
+
+    - name: Upload build log
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log-${{ github.run_id }}
+        path: openwrt/build.log
+        retention-days: 7
+        if-no-files-found: ignore
 
     - name: Check space usage
       if: (!cancelled())
